@@ -14,6 +14,8 @@
 
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <atomic>
+#include <cassert>
 #include <cmath>
 #include <errno.h>
 #include <stdbool.h>
@@ -93,7 +95,6 @@ public:
         swsCtx = nullptr;
         firstVideoFrame = lastVideoFrame = nullptr;
         curVideoFrame = nullptr;
-        videoFrameCount = 0;
         audioDev = 0;
         outBufferPos = 0;
         currentRate = rate;
@@ -126,9 +127,7 @@ public:
             swsCtx = nullptr;
         }
         while (firstVideoFrame) {
-            VideoFrame* t = firstVideoFrame;
-            firstVideoFrame = t->next;
-            delete t;
+            delete std::exchange(firstVideoFrame, firstVideoFrame->next);
         }
         if (scaledFrame != nullptr) {
             if (scaledFrame->data[0] != nullptr) {
@@ -148,7 +147,7 @@ public:
         delete[] outBuffer;
     }
 
-    volatile int stopped;
+    std::atomic_bool stopped{ false };
     AVFormatContext* formatContext;
     AVPacket readingPacket;
     AVFrame* frame;
@@ -182,10 +181,14 @@ public:
     int video_frames;
     AVFrame* scaledFrame;
     SwsContext* swsCtx;
+
+    std::mutex videoFrameLock;
     VideoFrame* firstVideoFrame;
     VideoFrame* lastVideoFrame;
-    volatile VideoFrame* volatile curVideoFrame;
-    int videoFrameCount;
+    VideoFrame* curVideoFrame;
+    // need an atomic here because it can be accessed when not under the lock
+    std::atomic_int videoFrameCount{ 0 };
+
     unsigned int totalVideoLen;
     long long videoStartTime;
     PixelOverlayModel* videoOverlayModel = nullptr;
@@ -201,29 +204,28 @@ public:
 
     void addVideoFrame(int ms, uint8_t* d, int sz) {
         VideoFrame* f = new VideoFrame(ms, d, sz);
-        if (firstVideoFrame == nullptr) {
-            curVideoFrame = f;
-            firstVideoFrame = f;
-            lastVideoFrame = f;
-        } else {
+        std::lock_guard lock(videoFrameLock);
+        if (lastVideoFrame) [[likely]] {
             lastVideoFrame->next = f;
             lastVideoFrame = f;
+        } else {
+            curVideoFrame = firstVideoFrame = lastVideoFrame = f;
         }
-        ++videoFrameCount;
+        videoFrameCount.store(videoFrameCount.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     int buffersFull(bool flushaudio) {
         int retVal = -1;
         if (video_stream_idx != -1) {
             // if video
+            std::lock_guard lock(videoFrameLock);
+            int count = videoFrameCount.load(std::memory_order_relaxed);
             while (firstVideoFrame && (firstVideoFrame != curVideoFrame)) {
-                videoFrameCount--;
-                auto tmp = firstVideoFrame->next;
-                delete firstVideoFrame;
-                firstVideoFrame = tmp;
+                delete std::exchange(firstVideoFrame, firstVideoFrame->next);
+                videoFrameCount.store(--count, std::memory_order_relaxed);
             }
-            retVal = (doneRead || (videoFrameCount >= VIDEO_FRAME_MAX)) ? 2
-                                                                        : ((videoFrameCount >= (VIDEO_FRAME_MAX - 6)) ? 1 : 0);
+            retVal = (doneRead || (count >= VIDEO_FRAME_MAX)) ? 2
+                                                                        : ((count >= (VIDEO_FRAME_MAX - 6)) ? 1 : 0);
             if (!flushaudio) {
                 return retVal;
             }
@@ -274,7 +276,7 @@ public:
         return 2;
     }
     int maybeFillBuffer(bool first) {
-        if (doneRead || videoFrameCount > VIDEO_FRAME_MAX) {
+        if (doneRead || videoFrameCount.load() > VIDEO_FRAME_MAX) {
             // buffers are full, don't so anything
             if (AudioHasStalled)
                 LogWarn(VB_MEDIAOUT, "Stalled audio, buffers are full.  %d\n", doneRead);
@@ -353,7 +355,7 @@ public:
 
             if (packetOk) {
                 if (first) {
-                    if ((outBufferPos > minQueueSize || videoFrameCount > VIDEO_FRAME_MAX)) {
+                    if ((outBufferPos > minQueueSize || videoFrameCount.load() > VIDEO_FRAME_MAX)) {
                         return outBufferPos - orig;
                     }
                 } else if (video_stream_idx != -1 && !vidPacket) {
@@ -439,30 +441,34 @@ static int open_codec_context(int* stream_idx,
     return 0;
 }
 
-typedef enum SDLSTATE {
-    SDLUNINITIALISED,
-    SDLINITIALISED,
-    SDLOPENED,
-    SDLPLAYING,
-    SDLNOTPLAYING,
-    SDLDESTROYED
-} SDLSTATE;
+enum SDLSTATE {
+    SDLUNINITIALISED, // initial state
+    SDLINITIALISED, // set by initSDL() from SDL::Start()
+    SDLOPENED, // set by openAudio() from SDL::Start()
+    SDLSTARTING, // set by SDL::Start()
+    SDLPLAYING, // set by by the thread in runDecode() when it sees SDLSTARTING
+    SDLSTOPPING, // set by SDL::Stop()
+    SDLNOTPLAYING, // set by the thread in runDecode() when it sees SDLSTOPPING
+    SDLDESTROYED // set by the thread in runDecode() when about to exit
+};
 
 class SDL {
-    volatile SDLSTATE _state;
+    std::atomic<SDLSTATE> _state{ SDLSTATE::SDLUNINITIALISED };
     SDL_AudioSpec _wanted_spec;
     int _initialisedRate;
     int _bytesPerSample;
     int _channels;
     bool _isSampleFloat;
     SDL_AudioDeviceID audioDev;
-    std::atomic_bool decoding;
+    std::atomic_bool decoding{ false };
 
 public:
-    SDL() :
-        data(nullptr),
-        _state(SDLSTATE::SDLUNINITIALISED),
-        decodeThread(nullptr) {}
+    SDLInternalData* data{ nullptr };
+    std::thread decodeThread;
+    std::set<std::string> blacklisted;
+
+public:
+    SDL() = default;
     virtual ~SDL();
 
     int getRate() { return _initialisedRate; }
@@ -470,10 +476,6 @@ public:
     bool isSamplesFloat() { return _isSampleFloat; }
     int numChannels() { return _channels; }
 
-    static void decodeThreadEntry(SDL* sdl) {
-        SetThreadName("FPP-SDLDecode");
-        sdl->runDecode();
-    }
     bool Start(SDLInternalData* d, int msTime) {
         if (!initSDL()) {
             return false;
@@ -496,32 +498,33 @@ public:
                     d->outBufferPos -= c;
                     d->maybeFillBuffer(false);
 
-                    while (d->firstVideoFrame && d->firstVideoFrame->timestamp < msTime) {
-                        VideoFrame* t = d->firstVideoFrame;
-                        d->firstVideoFrame = t->next;
-                        delete t;
+                    {
+                        std::lock_guard lock(d->videoFrameLock);
+                        while (d->firstVideoFrame && d->firstVideoFrame->timestamp < msTime) {
+                            delete std::exchange(d->firstVideoFrame, d->firstVideoFrame->next);
+                            d->videoFrameCount.store(d->videoFrameCount.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+                        }
+                        d->curVideoFrame = d->firstVideoFrame;
                     }
-                    d->curVideoFrame = d->firstVideoFrame;
                     d->maybeFillBuffer(false);
                 } else {
                     // need to skip the entire chunk, just wipe it out
                     d->curPos += d->outBufferPos;
                     d->outBufferPos = 0;
-                    while (d->firstVideoFrame) {
-                        VideoFrame* t = d->firstVideoFrame;
-                        d->firstVideoFrame = t->next;
-                        delete t;
+                    {
+                        std::lock_guard lock(d->videoFrameLock);
+                        while (d->firstVideoFrame) {
+                            delete std::exchange(d->firstVideoFrame, d->firstVideoFrame->next);
+                        }
+                        d->videoFrameCount.store(0, std::memory_order_relaxed);
+                        d->curVideoFrame = nullptr;
                     }
-                    d->curVideoFrame = nullptr;
                     d->maybeFillBuffer(false);
                 }
             }
         }
 
-        if (!decodeThread) {
-            decodeThread = new std::thread(decodeThreadEntry, this);
-        }
-        if (_state != SDLSTATE::SDLINITIALISED && _state != SDLSTATE::SDLUNINITIALISED) {
+        if (auto state = _state.load(); state != SDLSTATE::SDLINITIALISED && state != SDLSTATE::SDLUNINITIALISED) {
             data = d;
             data->audioDev = audioDev;
             if (audioDev) {
@@ -544,43 +547,44 @@ public:
             }
             long long t = GetTime() / 1000;
             data->videoStartTime = t;
-            _state = SDLSTATE::SDLPLAYING;
+            _state = SDLSTATE::SDLSTARTING;
+            if (!decodeThread.joinable()) {
+                decodeThread = std::thread(&SDL::runDecode, this);
+            }
+            else {
+                _state.notify_one();
+            }
             return true;
         }
         return false;
     }
     void Stop() {
-        if (_state == SDLSTATE::SDLPLAYING) {
+        if (auto state = _state.load(); state == SDLSTATE::SDLPLAYING || state == SDLSTATE::SDLSTARTING) {
             if (audioDev) {
                 SDL_PauseAudioDevice(audioDev, 1);
                 SDL_ClearQueuedAudio(audioDev);
             }
-            SDLInternalData* d = data;
-            data = nullptr;
-            _state = SDLSTATE::SDLNOTPLAYING;
-            while (decoding) {
-                // wait for decoding thread to be done with it
-                std::this_thread::yield();
-            }
+            _state = SDLSTATE::SDLSTOPPING;
+            // Wait for the decoding thread to see the STOPPING state and pause
+            _state.wait(SDLSTATE::SDLSTOPPING);
+            assert(_state == SDLSTATE::SDLNOTPLAYING);
+            assert(!decoding);
         }
     }
     void Close() {
         Stop();
-        if (_state != SDLSTATE::SDLINITIALISED && _state != SDLSTATE::SDLUNINITIALISED) {
+        if (auto state = _state.load(); state != SDLSTATE::SDLINITIALISED && state != SDLSTATE::SDLUNINITIALISED) {
             if (audioDev) {
                 SDL_CloseAudioDevice(audioDev);
             }
             _state = SDLSTATE::SDLINITIALISED;
+            _state.notify_one(); // wake possibly waiting decode thread
         }
     }
 
     bool initSDL();
     bool openAudio();
     void runDecode();
-
-    SDLInternalData* volatile data;
-    std::thread* decodeThread;
-    std::set<std::string> blacklisted;
 };
 
 static SDL sdlManager;
@@ -597,53 +601,61 @@ bool SDL::initSDL() {
 }
 
 void SDL::runDecode() {
-    while (_state != SDLSTATE::SDLUNINITIALISED) {
+    SetThreadName("FPP-SDLDecode");
+    SDLInternalData* data = nullptr;
+    for (SDLSTATE state; (state = _state.load()) != SDLSTATE::SDLUNINITIALISED;) {
+        switch (state) {
+            case SDLSTATE::SDLSTARTING:
+                data = this->data;
+                assert(data);
+                _state = SDLSTATE::SDLPLAYING;
+                _state.notify_one();
+                [[fallthrough]];
+            case SDLSTATE::SDLPLAYING: // expected state; continue looping
+                break;
+            case SDLSTATE::SDLSTOPPING: // main thread wants us to pause
+                _state = state = SDLSTATE::SDLNOTPLAYING;
+                _state.notify_one();
+                [[fallthrough]];
+            default:
+                _state.wait(state); // wait until the state changes
+                continue;
+        }
         decoding = true;
-        SDLInternalData* data = this->data;
-        if (data == nullptr) {
-            decoding = false;
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
-        } else {
-            int bufFull = data->buffersFull(true);
-            bool bufFillWas0 = false;
-            int count = 0;
-            while (bufFull == 0 && count < 5) {
-                // critical, the SDL queue is < max
-                data->maybeFillBuffer(false);
-                bufFull = data->buffersFull(false);
-                bufFillWas0 = true;
-                count++;
-            }
-            count = 0;
-            int countRead = 0;
-            while (bufFull != 2 && count < 5) {
-                count++;
-                if (data->outBufferPos > data->minQueueSize) {
-                    // single packet
-                    countRead += data->maybeFillBuffer(false);
+        int bufFull = data->buffersFull(true);
+        bool bufFillWas0 = false;
+        int count = 0;
+        while (bufFull == 0 && count < 5) {
+            // critical, the SDL queue is < max
+            data->maybeFillBuffer(false);
+            bufFull = data->buffersFull(false);
+            bufFillWas0 = true;
+            count++;
+        }
+        count = 0;
+        int countRead = 0;
+        while (bufFull != 2 && count < 5) {
+            count++;
+            if (data->outBufferPos > data->minQueueSize) {
+                // single packet
+                countRead += data->maybeFillBuffer(false);
+                bufFull = 2;
+            } else {
+                // read a little more than single
+                countRead += data->maybeFillBuffer(false);
+                if (countRead > (data->currentRate * data->bytesPerSample * data->channels / 10)) {
+                    // read a 1/10 of a second, move on
                     bufFull = 2;
                 } else {
-                    // read a little more than single
-                    countRead += data->maybeFillBuffer(false);
-                    if (countRead > (data->currentRate * data->bytesPerSample * data->channels / 10)) {
-                        // read a 1/10 of a second, move on
-                        bufFull = 2;
-                    } else {
-                        bufFull = data->buffersFull(false);
-                    }
+                    bufFull = data->buffersFull(false);
                 }
             }
-            if (data->video_stream_idx != -1 && data->videoFrameCount < 15) {
-                // we won't sleep, need to keep decoding
-                decoding = false;
-            } else {
-                decoding = false;
-                if (bufFillWas0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-                }
-            }
+        }
+        decoding = false;
+        if (data->video_stream_idx != -1 && data->videoFrameCount.load() < 15) {
+            // we won't sleep, need to keep decoding
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(bufFillWas0 ? 10 : 25));
         }
     }
     _state = SDLSTATE::SDLDESTROYED;
@@ -859,18 +871,10 @@ SDL::~SDL() {
     if (_state != SDLSTATE::SDLUNINITIALISED) {
         SDL_Quit();
         _state = SDLSTATE::SDLUNINITIALISED;
+        _state.notify_one();
     }
-    if (decodeThread) {
-        int count = 0;
-        while (count < 30) {
-            if (_state == SDLSTATE::SDLDESTROYED) {
-                count = 30;
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-        }
-        decodeThread->detach();
-        delete decodeThread;
+    if (decodeThread.joinable()) {
+        decodeThread.join();
     }
 }
 
@@ -880,17 +884,18 @@ bool SDLOutput::IsOverlayingVideo() {
 }
 bool SDLOutput::ProcessVideoOverlay(unsigned int msTimestamp) {
     SDLInternalData* data = sdlManager.data;
-    if (data && !data->stopped && data->video_stream_idx != -1 && data->curVideoFrame) {
+    if (data && !data->stopped && data->video_stream_idx != -1) {
+        std::lock_guard lock(data->videoFrameLock);
+        if (!data->curVideoFrame)
+            return false;
+
         while (data->curVideoFrame->next && data->curVideoFrame->next->timestamp <= msTimestamp) {
             data->curVideoFrame = data->curVideoFrame->next;
         }
         if (msTimestamp <= data->totalVideoLen) {
             VideoFrame* vf = (VideoFrame*)data->curVideoFrame;
 
-            long long t = GetTime() / 1000;
-            int t2 = ((int)t) - data->videoStartTime;
-
-            // printf("v:  %d  %d      %d        %d\n", msTimestamp, vf->timestamp, t2, sdlManager.data->videoFrameCount);
+            // printf("v:  %d  %d      %d        %d\n", msTimestamp, vf->timestamp, (int)((GetTime() / 1000) - data->videoStartTime), sdlManager.data->videoFrameCount.load());
             std::unique_lock<std::mutex> lock(data->videoOverlayModelLock);
             if (data->videoOverlayModel) {
                 data->videoOverlayModel->setData(vf->data);
@@ -1126,7 +1131,7 @@ SDLOutput::SDLOutput(const std::string& mediaFilename,
                                       nullptr, nullptr);
     }
 
-    data->stopped = 0;
+    data->stopped = false;
     data->maybeFillBuffer(true);
 }
 
@@ -1286,7 +1291,7 @@ int SDLOutput::Stop(void) {
     LogDebug(VB_MEDIAOUT, "SDLOutput::Stop()\n");
     sdlManager.Stop();
     if (data) {
-        data->stopped = data->stopped + 1;
+        data->stopped = true;
         if (data->video_stream_idx >= 0 && data->videoOverlayModel) {
             std::unique_lock<std::mutex> lock(data->videoOverlayModelLock);
             if (data->wasOverlayDisabled) {
