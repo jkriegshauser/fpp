@@ -79,35 +79,15 @@ static int DTStoMS(int64_t dts, int dtspersec) {
 class SDLInternalData {
 public:
     SDLInternalData(int rate, int bps, bool flt, int ch, int offset) :
-        curPos(0),
+        currentRate(rate),
+        bytesPerSample(bps),
+        channels(ch),
+        isSamplesFloat(flt),
+        minQueueSize(rate * bps * 2 * ch),
+        maxQueueSize(minQueueSize * ch),
         mediaOffset(offset) {
-        formatContext = nullptr;
-        audioCodecContext = nullptr;
-        videoCodecContext = nullptr;
-        audio_stream_idx = -1;
-        video_stream_idx = -1;
-        videoStream = audioStream = nullptr;
-        doneRead = false;
-        frame = av_frame_alloc();
-        scaledFrame = nullptr;
-        au_convert_ctx = nullptr;
-        decodedDataLen = 0;
-        swsCtx = nullptr;
-        firstVideoFrame = lastVideoFrame = nullptr;
-        curVideoFrame = nullptr;
-        audioDev = 0;
-        outBufferPos = 0;
-        currentRate = rate;
-        bytesPerSample = bps;
-        isSamplesFloat = flt;
-        channels = ch;
-
-        minQueueSize = rate * bps * 2 * ch; // 2 seconds of 2 channel audio
-        maxQueueSize = minQueueSize * ch;
-        outBuffer = new uint8_t[maxQueueSize];
-
-        sampleBuffer = new uint8_t[maxQueueSize * 2];
-        sampleBufferCount = 0;
+        outBuffer = std::make_unique<uint8_t[]>(maxQueueSize);
+        sampleBuffer = std::make_unique<uint8_t[]>(maxQueueSize * 2);
     }
     ~SDLInternalData() {
         if (frame != nullptr) {
@@ -142,52 +122,48 @@ public:
         if (au_convert_ctx != nullptr) {
             swr_free(&au_convert_ctx);
         }
-
-        delete[] sampleBuffer;
-        delete[] outBuffer;
     }
 
     std::atomic_bool stopped{ false };
-    AVFormatContext* formatContext;
+    AVFormatContext* formatContext{ nullptr };
     AVPacket readingPacket;
-    AVFrame* frame;
+    AVFrame* frame{ av_frame_alloc() };
 
     // stuff for the audio stream
-    AVCodecContext* audioCodecContext;
+    AVCodecContext* audioCodecContext{ nullptr };
     int audio_stream_idx = -1;
-    AVStream* audioStream;
-    SwrContext* au_convert_ctx;
+    AVStream* audioStream{ nullptr };
+    SwrContext* au_convert_ctx{ nullptr };
     unsigned int totalDataLen;
-    unsigned int decodedDataLen;
+    unsigned int decodedDataLen{ 0 };
     float totalLen;
-    SDL_AudioDeviceID audioDev;
-    int outBufferPos = 0;
-    uint8_t* outBuffer;
-    int currentRate;
-    int bytesPerSample;
-    int channels;
-    bool isSamplesFloat;
-    int minQueueSize;
-    int maxQueueSize;
+    SDL_AudioDeviceID audioDev{ 0 };
+    int outBufferPos{ 0 };
+    std::unique_ptr<uint8_t[]> outBuffer;
+    const int currentRate;
+    const int bytesPerSample;
+    const int channels;
+    const bool isSamplesFloat;
+    const int minQueueSize;
+    const int maxQueueSize;
 
-    uint8_t* sampleBuffer;
-    int sampleBufferCount;
+    std::unique_ptr<uint8_t[]> sampleBuffer;
+    int sampleBufferCount{ 0 };
 
     // stuff for the video stream
-    AVCodecContext* videoCodecContext;
-    int video_stream_idx = -1;
-    AVStream* videoStream;
+    AVCodecContext* videoCodecContext{ nullptr };
+    int video_stream_idx{ -1 };
+    AVStream* videoStream{ nullptr };
     int video_dtspersec;
     int video_frames;
-    AVFrame* scaledFrame;
-    SwsContext* swsCtx;
+    AVFrame* scaledFrame{ nullptr };
+    SwsContext* swsCtx{ nullptr };
 
     std::mutex videoFrameLock;
-    VideoFrame* firstVideoFrame;
-    VideoFrame* lastVideoFrame;
-    VideoFrame* curVideoFrame;
-    // need an atomic here because it can be accessed when not under the lock
-    std::atomic_int videoFrameCount{ 0 };
+    VideoFrame* firstVideoFrame{ nullptr };
+    VideoFrame* lastVideoFrame{ nullptr };
+    VideoFrame* curVideoFrame{ nullptr };
+    int videoFrameCount{ 0 };
 
     unsigned int totalVideoLen;
     long long videoStartTime;
@@ -196,11 +172,11 @@ public:
     std::mutex videoOverlayModelLock;
     bool wasOverlayDisabled = false;
 
-    bool doneRead;
-    unsigned int curPos;
+    bool doneRead{ false };
+    unsigned int curPos{ 0 };
     std::mutex curPosLock;
-    int32_t mediaOffset = 0;
-    uint32_t extraDataLen = 0;
+    int32_t mediaOffset;
+    uint32_t extraDataLen{ 0 };
 
     void addVideoFrame(int ms, uint8_t* d, int sz) {
         VideoFrame* f = new VideoFrame(ms, d, sz);
@@ -211,7 +187,7 @@ public:
         } else {
             curVideoFrame = firstVideoFrame = lastVideoFrame = f;
         }
-        videoFrameCount.store(videoFrameCount.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        ++videoFrameCount;
     }
 
     int buffersFull(bool flushaudio) {
@@ -219,42 +195,39 @@ public:
         if (video_stream_idx != -1) {
             // if video
             std::lock_guard lock(videoFrameLock);
-            int count = videoFrameCount.load(std::memory_order_relaxed);
             while (firstVideoFrame && (firstVideoFrame != curVideoFrame)) {
                 delete std::exchange(firstVideoFrame, firstVideoFrame->next);
-                videoFrameCount.store(--count, std::memory_order_relaxed);
+                --videoFrameCount;
             }
-            retVal = (doneRead || (count >= VIDEO_FRAME_MAX)) ? 2
-                                                                        : ((count >= (VIDEO_FRAME_MAX - 6)) ? 1 : 0);
+            retVal = (doneRead || (videoFrameCount >= VIDEO_FRAME_MAX)) ? 2
+                                                                        : ((videoFrameCount >= (VIDEO_FRAME_MAX - 6)) ? 1 : 0);
             if (!flushaudio) {
                 return retVal;
             }
         }
         if (audioDev == 0) {
             // no audio device, clear the audio buffer
-            curPosLock.lock();
+            std::lock_guard lock(curPosLock);
             curPos += outBufferPos;
             outBufferPos = 0;
-            curPosLock.unlock();
             return retVal >= 0 ? retVal : 2;
         }
         unsigned int queue = SDL_GetQueuedAudioSize(audioDev);
         // if we have data and are either below the queue threshold or we've finished reading
         if (outBufferPos && ((queue < minQueueSize) || doneRead)) {
-            curPosLock.lock();
-            SDL_QueueAudio(audioDev, outBuffer, outBufferPos);
+            std::lock_guard lock(curPosLock);
+            SDL_QueueAudio(audioDev, outBuffer.get(), outBufferPos);
             queue = SDL_GetQueuedAudioSize(audioDev);
             int ms = queue - outBufferPos;
             if (ms < sampleBufferCount) {
-                memmove(sampleBuffer, &sampleBuffer[sampleBufferCount - ms], ms);
+                memmove(sampleBuffer.get(), &sampleBuffer[sampleBufferCount - ms], ms);
                 sampleBufferCount = ms;
             }
-            memcpy(&sampleBuffer[sampleBufferCount], outBuffer, outBufferPos);
+            memcpy(&sampleBuffer[sampleBufferCount], outBuffer.get(), outBufferPos);
             sampleBufferCount += outBufferPos;
 
             curPos += outBufferPos;
             outBufferPos = 0;
-            curPosLock.unlock();
         }
         if (retVal >= 0) {
             return retVal;
@@ -276,7 +249,7 @@ public:
         return 2;
     }
     int maybeFillBuffer(bool first) {
-        if (doneRead || videoFrameCount.load() > VIDEO_FRAME_MAX) {
+        if (doneRead || std::atomic_ref(videoFrameCount).load() > VIDEO_FRAME_MAX) {
             // buffers are full, don't so anything
             if (AudioHasStalled)
                 LogWarn(VB_MEDIAOUT, "Stalled audio, buffers are full.  %d\n", doneRead);
@@ -355,7 +328,7 @@ public:
 
             if (packetOk) {
                 if (first) {
-                    if ((outBufferPos > minQueueSize || videoFrameCount.load() > VIDEO_FRAME_MAX)) {
+                    if ((outBufferPos > minQueueSize || std::atomic_ref(videoFrameCount).load() > VIDEO_FRAME_MAX)) {
                         return outBufferPos - orig;
                     }
                 } else if (video_stream_idx != -1 && !vidPacket) {
@@ -494,7 +467,7 @@ public:
                 int c = samplesRequired - d->curPos;
                 if (c < d->outBufferPos) {
                     d->curPos += c;
-                    memcpy(d->outBuffer, &d->outBuffer[c], d->outBufferPos - c);
+                    memcpy(d->outBuffer.get(), &d->outBuffer[c], d->outBufferPos - c);
                     d->outBufferPos -= c;
                     d->maybeFillBuffer(false);
 
@@ -502,7 +475,7 @@ public:
                         std::lock_guard lock(d->videoFrameLock);
                         while (d->firstVideoFrame && d->firstVideoFrame->timestamp < msTime) {
                             delete std::exchange(d->firstVideoFrame, d->firstVideoFrame->next);
-                            d->videoFrameCount.store(d->videoFrameCount.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+                            --d->videoFrameCount;
                         }
                         d->curVideoFrame = d->firstVideoFrame;
                     }
@@ -516,7 +489,7 @@ public:
                         while (d->firstVideoFrame) {
                             delete std::exchange(d->firstVideoFrame, d->firstVideoFrame->next);
                         }
-                        d->videoFrameCount.store(0, std::memory_order_relaxed);
+                        d->videoFrameCount = 0;
                         d->curVideoFrame = nullptr;
                     }
                     d->maybeFillBuffer(false);
@@ -528,19 +501,20 @@ public:
             data = d;
             data->audioDev = audioDev;
             if (audioDev) {
-                data->curPosLock.lock();
-                SDL_ClearQueuedAudio(audioDev);
-                if (data->mediaOffset < 0) {
-                    data->queueSilence(-data->mediaOffset);
-                    data->mediaOffset = 0;
+                {
+                    std::lock_guard lock(data->curPosLock);
+                    SDL_ClearQueuedAudio(audioDev);
+                    if (data->mediaOffset < 0) {
+                        data->queueSilence(-data->mediaOffset);
+                        data->mediaOffset = 0;
+                    }
+                    SDL_QueueAudio(audioDev, data->outBuffer.get(), data->outBufferPos);
+                    memcpy(data->sampleBuffer.get(), data->outBuffer.get(), data->outBufferPos);
+                    data->sampleBufferCount = data->outBufferPos;
+                    data->curPos += data->outBufferPos;
+                    data->outBufferPos = 0;
                 }
-                SDL_QueueAudio(audioDev, data->outBuffer, data->outBufferPos);
-                memcpy(data->sampleBuffer, data->outBuffer, data->outBufferPos);
-                data->sampleBufferCount = data->outBufferPos;
-                data->curPos += data->outBufferPos;
-                data->outBufferPos = 0;
-                data->curPosLock.unlock();
-                SDL_PauseAudioDevice(audioDev, 0);
+                SDL_PauseAudioDevice(audioDev, 0); // unpause
             } else {
                 data->curPos = 0;
                 data->outBufferPos = 0;
@@ -550,8 +524,7 @@ public:
             _state = SDLSTATE::SDLSTARTING;
             if (!decodeThread.joinable()) {
                 decodeThread = std::thread(&SDL::runDecode, this);
-            }
-            else {
+            } else {
                 _state.notify_one();
             }
             return true;
@@ -652,7 +625,7 @@ void SDL::runDecode() {
             }
         }
         decoding = false;
-        if (data->video_stream_idx != -1 && data->videoFrameCount.load() < 15) {
+        if (data->video_stream_idx != -1 && std::atomic_ref(data->videoFrameCount).load() < 15) {
             // we won't sleep, need to keep decoding
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(bufFillWas0 ? 10 : 25));
@@ -895,7 +868,7 @@ bool SDLOutput::ProcessVideoOverlay(unsigned int msTimestamp) {
         if (msTimestamp <= data->totalVideoLen) {
             VideoFrame* vf = (VideoFrame*)data->curVideoFrame;
 
-            // printf("v:  %d  %d      %d        %d\n", msTimestamp, vf->timestamp, (int)((GetTime() / 1000) - data->videoStartTime), sdlManager.data->videoFrameCount.load());
+            // printf("v:  %d  %d      %d        %d\n", msTimestamp, vf->timestamp, (int)((GetTime() / 1000) - data->videoStartTime), std::atomic_ref(sdlManager.data->videoFrameCount).load());
             std::unique_lock<std::mutex> lock(data->videoOverlayModelLock);
             if (data->videoOverlayModel) {
                 data->videoOverlayModel->setData(vf->data);
@@ -912,11 +885,11 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
     SDLInternalData* data = sdlManager.data;
     if (data && !data->stopped) {
         // printf("In Samples:  %d\n", data->outBufferPos);
-        data->curPosLock.lock();
+        std::lock_guard lock(data->curPosLock);
         int queue = SDL_GetQueuedAudioSize(data->audioDev);
         if (data->bytesPerSample == 2) {
             int offset = data->sampleBufferCount - queue;
-            int16_t* ds = (int16_t*)(&data->sampleBuffer[offset]);
+            int16_t* ds = reinterpret_cast<int16_t*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
                 samples[x] = ds[x * data->channels];
@@ -924,7 +897,7 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
             }
         } else if (data->isSamplesFloat) {
             int offset = data->sampleBufferCount - queue;
-            float* ds = (float*)(&data->sampleBuffer[offset]);
+            float* ds = reinterpret_cast<float*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
                 samples[x] = ds[x * data->channels];
@@ -932,7 +905,7 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
         } else {
             // 32bit sampling
             int offset = data->sampleBufferCount - queue;
-            int32_t* ds = (int32_t*)(&data->sampleBuffer[offset]);
+            int32_t* ds = reinterpret_cast<int32_t*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
                 samples[x] = ds[x * data->channels];
@@ -940,7 +913,6 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
             }
         }
         sampleRate = data->currentRate;
-        data->curPosLock.unlock();
         return true;
     }
     return false;
@@ -1195,10 +1167,10 @@ int SDLOutput::Process(void) {
 
     if (data->audio_stream_idx != -1 && data->audioDev) {
         // if we have an audio stream, that drives everything
-        data->curPosLock.lock();
-        uint32_t audioSize = SDL_GetQueuedAudioSize(data->audioDev);
-        long cp = data->curPos + data->extraDataLen;
-        data->curPosLock.unlock();
+        auto const [audioSize, cp] = [this] {
+            std::lock_guard lock(data->curPosLock);
+            return std::pair{ SDL_GetQueuedAudioSize(data->audioDev), data->curPos + data->extraDataLen };
+        }();
         float curtime = cp - (float)audioSize;
         curtime -= (DEFAULT_NUM_SAMPLES * data->channels);
 
