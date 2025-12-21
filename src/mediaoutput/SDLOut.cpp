@@ -76,6 +76,13 @@ static int DTStoMS(int64_t dts, int dtspersec) {
     return (int)(((int64_t)1000 * dts) / (int64_t)dtspersec);
 }
 
+enum class BufferState {
+    Error = -1,
+    TooEmpty,
+    Safe,
+    Full
+};
+
 class SDLInternalData {
 public:
     SDLInternalData(int rate, int bps, bool flt, int ch, int offset) :
@@ -126,7 +133,6 @@ public:
 
     std::atomic_bool stopped{ false };
     AVFormatContext* formatContext{ nullptr };
-    AVPacket readingPacket;
     AVFrame* frame{ av_frame_alloc() };
 
     // stuff for the audio stream
@@ -190,8 +196,8 @@ public:
         ++videoFrameCount;
     }
 
-    int buffersFull(bool flushaudio) {
-        int retVal = -1;
+    [[nodiscard]] BufferState buffersFull(bool flushaudio) {
+        BufferState retVal = BufferState::Error;
         if (video_stream_idx != -1) {
             // if video
             std::lock_guard lock(videoFrameLock);
@@ -199,8 +205,8 @@ public:
                 delete std::exchange(firstVideoFrame, firstVideoFrame->next);
                 --videoFrameCount;
             }
-            retVal = (doneRead || (videoFrameCount >= VIDEO_FRAME_MAX)) ? 2
-                                                                        : ((videoFrameCount >= (VIDEO_FRAME_MAX - 6)) ? 1 : 0);
+            retVal = (doneRead || (videoFrameCount >= VIDEO_FRAME_MAX)) ? BufferState::Full
+                                                                        : ((videoFrameCount >= (VIDEO_FRAME_MAX - 6)) ? BufferState::Safe : BufferState::TooEmpty);
             if (!flushaudio) {
                 return retVal;
             }
@@ -210,7 +216,7 @@ public:
             std::lock_guard lock(curPosLock);
             curPos += outBufferPos;
             outBufferPos = 0;
-            return retVal >= 0 ? retVal : 2;
+            return retVal != BufferState::Error ? retVal : BufferState::Full;
         }
         unsigned int queue = SDL_GetQueuedAudioSize(audioDev);
         // if we have data and are either below the queue threshold or we've finished reading
@@ -229,7 +235,7 @@ public:
             curPos += outBufferPos;
             outBufferPos = 0;
         }
-        if (retVal >= 0) {
+        if (retVal != BufferState::Error) {
             return retVal;
         }
         if (doneRead) {
@@ -238,15 +244,15 @@ public:
                 queueSilence(mediaOffset);
                 mediaOffset = 0;
             }
-            return 2;
+            return BufferState::Full;
         }
         queue += outBufferPos;
         if (queue < minQueueSize) {
-            return 0;
+            return BufferState::TooEmpty;
         } else if (queue < maxQueueSize) {
-            return 1;
+            return BufferState::Safe;
         }
-        return 2;
+        return BufferState::Full;
     }
     int maybeFillBuffer(bool first) {
         if (doneRead || std::atomic_ref(videoFrameCount).load() > VIDEO_FRAME_MAX) {
@@ -259,6 +265,7 @@ public:
             LogWarn(VB_MEDIAOUT, "Stalled audio, buffers still filling.\n");
         int orig = outBufferPos;
         bool vidPacket = false;
+        AVPacket readingPacket;
         while (av_read_frame(formatContext, &readingPacket) == 0) {
             bool packetOk = false;
             if (readingPacket.stream_index == audio_stream_idx) {
@@ -275,15 +282,18 @@ public:
                         int max = maxQueueSize - outBufferPos;
                         int outSamples = swr_convert(au_convert_ctx,
                                                      &out_buffer,
-                                                     max / 4,
+                                                     max / bytesPerSample,
                                                      (const uint8_t**)frame->extended_data,
                                                      frame->nb_samples);
-
-                        outBufferPos += (outSamples * bytesPerSample * channels);
-                        if (outBufferPos > maxQueueSize) {
-                            AudioHasStalled = true;
+                        // LogDebug(VB_MEDIAOUT, "outSamples: %d outBufferPos: %d maxQueueSize: %d bytesPerSample: %d channels: %d\n", outSamples, outBufferPos, maxQueueSize, bytesPerSample, channels);
+                        if (outSamples > 0) {
+                            outBufferPos += (outSamples * bytesPerSample * channels);
+                            if (outBufferPos > maxQueueSize) {
+                                AudioHasStalled = true;
+                            }
+                            decodedDataLen += (outSamples * bytesPerSample * channels);
                         }
-                        decodedDataLen += (outSamples * bytesPerSample * channels);
+
                         av_frame_unref(frame);
                     }
                     if (packetSendCount > 1000 && lastPacketRecvCount == packetRecvCount) {
@@ -577,59 +587,58 @@ void SDL::runDecode() {
     SetThreadName("FPP-SDLDecode");
     std::shared_ptr<SDLInternalData> data;
     for (SDLSTATE state; (state = _state.load()) != SDLSTATE::SDLUNINITIALISED;) {
+        // Handle state
         switch (state) {
         case SDLSTATE::SDLSTARTING:
-            data = this->data.load();
+            data = this->data.load(); // reload our local view of `data`
             assert(data);
-            _state = SDLSTATE::SDLPLAYING;
+            _state = state = SDLSTATE::SDLPLAYING;
             _state.notify_one();
             [[fallthrough]];
         case SDLSTATE::SDLPLAYING: // expected state; continue looping
             break;
         case SDLSTATE::SDLSTOPPING: // main thread wants us to pause
             _state = state = SDLSTATE::SDLNOTPLAYING;
-            data.reset();
+            data.reset(); // clear our local view of `data`
             _state.notify_one();
             [[fallthrough]];
         default:
             _state.wait(state); // wait until the state changes
             continue;
         }
+
+        assert(state == SDLSTATE::SDLPLAYING);
         decoding = true;
-        int bufFull = data->buffersFull(true);
-        bool bufFillWas0 = false;
-        int count = 0;
-        while (bufFull == 0 && count < 5) {
+        auto bufState = data->buffersFull(true);
+        bool tooEmpty = false;
+        for (int count = 0; bufState == BufferState::TooEmpty && count < 5; ++count) {
             // critical, the SDL queue is < max
             data->maybeFillBuffer(false);
-            bufFull = data->buffersFull(false);
-            bufFillWas0 = true;
-            count++;
+            bufState = data->buffersFull(false);
+            tooEmpty = true;
         }
-        count = 0;
         int countRead = 0;
-        while (bufFull != 2 && count < 5) {
-            count++;
+        for (int count = 0; bufState != BufferState::Full && count < 5; ++count) {
             if (data->outBufferPos > data->minQueueSize) {
                 // single packet
                 countRead += data->maybeFillBuffer(false);
-                bufFull = 2;
+                bufState = BufferState::Full;
             } else {
                 // read a little more than single
                 countRead += data->maybeFillBuffer(false);
                 if (countRead > (data->currentRate * data->bytesPerSample * data->channels / 10)) {
                     // read a 1/10 of a second, move on
-                    bufFull = 2;
+                    bufState = BufferState::Full;
                 } else {
-                    bufFull = data->buffersFull(false);
+                    bufState = data->buffersFull(false);
                 }
             }
         }
         decoding = false;
         if (data->video_stream_idx != -1 && std::atomic_ref(data->videoFrameCount).load() < 15) {
-            // we won't sleep, need to keep decoding
+            // we won't sleep, need to keep decoding video
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(bufFillWas0 ? 10 : 25));
+            std::this_thread::sleep_for(std::chrono::milliseconds(tooEmpty ? 10 : 25));
         }
     }
     _state = SDLSTATE::SDLDESTROYED;
