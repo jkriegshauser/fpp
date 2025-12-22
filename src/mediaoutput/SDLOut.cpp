@@ -218,16 +218,17 @@ public:
             outBufferPos = 0;
             return retVal != BufferState::Error ? retVal : BufferState::Full;
         }
-        unsigned int queue = SDL_GetQueuedAudioSize(audioDev);
+        unsigned int queued = SDL_GetQueuedAudioSize(audioDev);
         // if we have data and are either below the queue threshold or we've finished reading
-        if (outBufferPos && ((queue < minQueueSize) || doneRead)) {
-            std::lock_guard lock(curPosLock);
+        if (outBufferPos && ((queued < minQueueSize) || doneRead)) {
             SDL_QueueAudio(audioDev, outBuffer.get(), outBufferPos);
-            queue = SDL_GetQueuedAudioSize(audioDev);
-            int ms = queue - outBufferPos;
-            if (ms < sampleBufferCount) {
-                memmove(sampleBuffer.get(), &sampleBuffer[sampleBufferCount - ms], ms);
-                sampleBufferCount = ms;
+            unsigned int prevQueued = queued;
+            queued += outBufferPos;
+
+            std::lock_guard lock(curPosLock);
+            if (sampleBufferCount > prevQueued) {
+                memmove(sampleBuffer.get(), &sampleBuffer[sampleBufferCount - prevQueued], prevQueued);
+                sampleBufferCount = prevQueued;
             }
             memcpy(&sampleBuffer[sampleBufferCount], outBuffer.get(), outBufferPos);
             sampleBufferCount += outBufferPos;
@@ -246,10 +247,10 @@ public:
             }
             return BufferState::Full;
         }
-        queue += outBufferPos;
-        if (queue < minQueueSize) {
+        queued += outBufferPos;
+        if (queued < minQueueSize) {
             return BufferState::TooEmpty;
-        } else if (queue < maxQueueSize) {
+        } else if (queued < maxQueueSize) {
             return BufferState::Safe;
         }
         return BufferState::Full;
@@ -897,16 +898,18 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
         // printf("In Samples:  %d\n", data->outBufferPos);
         std::lock_guard lock(data->curPosLock);
         int queue = SDL_GetQueuedAudioSize(data->audioDev);
+        const int origNumSamples = numSamples;
         if (data->bytesPerSample == 2) {
             int offset = data->sampleBufferCount - queue;
+            numSamples = std::min<int>(numSamples, (data->sampleBufferCount - offset) / sizeof(int16_t));
             int16_t* ds = reinterpret_cast<int16_t*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
-                samples[x] = ds[x * data->channels];
-                samples[x] /= 32767.0f;
+                samples[x] = float(ds[x * data->channels]) / 32767.f;
             }
         } else if (data->isSamplesFloat) {
             int offset = data->sampleBufferCount - queue;
+            numSamples = std::min<int>(numSamples, (data->sampleBufferCount - offset) / sizeof(float));
             float* ds = reinterpret_cast<float*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
@@ -915,6 +918,7 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
         } else {
             // 32bit sampling
             int offset = data->sampleBufferCount - queue;
+            numSamples = std::min<int>(numSamples, (data->sampleBufferCount - offset) / sizeof(int32_t));
             int32_t* ds = reinterpret_cast<int32_t*>(&data->sampleBuffer[offset]);
             // just grab the left channel audio
             for (int x = 0; x < numSamples; x++) {
@@ -922,6 +926,8 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
                 samples[x] /= 0x8FFFFFFF;
             }
         }
+        for (int x = numSamples; x != origNumSamples; ++x)
+            samples[x] = 0.f;
         sampleRate = data->currentRate;
         return true;
     }
