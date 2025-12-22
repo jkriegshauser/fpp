@@ -42,11 +42,11 @@ extern "C" {
 #include "SDLOut.h"
 
 // Only keep 30 frames in buffer
-#define VIDEO_FRAME_MAX 30
+static constexpr int VIDEO_FRAME_MAX = 30;
 
 static const int DEFAULT_NUM_SAMPLES = 2048;
 
-static bool AudioHasStalled = false;
+static std::atomic_bool AudioHasStalled{ false };
 
 class VideoFrame {
 public:
@@ -436,7 +436,7 @@ enum SDLSTATE {
     SDLDESTROYED      // set by the thread in runDecode() when about to exit
 };
 
-class SDL {
+class SDL final {
     std::atomic<SDLSTATE> _state{ SDLSTATE::SDLUNINITIALISED };
     SDL_AudioSpec _wanted_spec;
     int _initialisedRate;
@@ -453,12 +453,12 @@ public:
 
 public:
     SDL() = default;
-    virtual ~SDL();
+    ~SDL();
 
-    int getRate() { return _initialisedRate; }
-    int getBytesPerSample() { return _bytesPerSample; }
-    bool isSamplesFloat() { return _isSampleFloat; }
-    int numChannels() { return _channels; }
+    int getRate() const { return _initialisedRate; }
+    int getBytesPerSample() const { return _bytesPerSample; }
+    bool isSamplesFloat() const { return _isSampleFloat; }
+    int numChannels() const { return _channels; }
 
     bool Start(std::shared_ptr<SDLInternalData> d, int msTime) {
         if (!initSDL()) {
@@ -571,6 +571,7 @@ public:
     void runDecode();
 };
 
+static std::string currentMediaFilename;
 static SDL sdlManager;
 
 bool SDL::initSDL() {
@@ -933,8 +934,6 @@ bool SDLOutput::GetAudioSamples(float* samples, int numSamples, int& sampleRate)
     }
     return false;
 }
-
-static std::string currentMediaFilename;
 
 static void LogCallback(void* avcl,
                         int level,
